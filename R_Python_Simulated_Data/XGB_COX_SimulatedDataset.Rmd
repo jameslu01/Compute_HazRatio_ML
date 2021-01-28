@@ -1,0 +1,142 @@
+Computing the Hazard Ratios associated with Explanatory Variables using Machine Learning Models of Survival Data
+Authors: Sameer Sundrani and James Lu,*
+
+Affiliations: 
+1) Modeling & Simulation/Clinical Pharmacology, Genentech, South San Francisco, California 
+2) Biomedical Computation, Schools of Engineering and Medicine, Stanford University, Stanford, California 
+*Corresponding author. Email: lu.james@gene.com 
+
+
+This R Notebook contains all the code used for CoxPH / XGBoost Comparisons for simulated survival data only.
+the following sections:
+(1) Set Directory
+(2) Packages and Functions 
+(3) Generate Simulated Data
+
+Set working directory for saving files
+```{r}
+#Location of where to store resulting files and figures, everything will be saved here
+dir <- paste0(dirname(rstudioapi::getActiveDocumentContext()$path),"/")
+dir.create("data_sim")
+dir.create("results_sim")
+
+
+#global constants used for parsing dataframes
+coef_val <- 7 #location in the CoxPH table for coef
+ci_val <- 8 #location in the CoxPH table for CI
+```
+
+Include These Packages for Analysis
+```{r}
+#package needed for Breast Cancer data
+library("condSURV")
+
+#packages specific for Nature Data b/c we need to clean the data
+library(rpart)
+library(mice)
+library(dummies)
+
+#general packages
+library(tidyverse)
+library(extraFunctions)
+library(haven)
+library(rlang)
+library(aod)
+library(ggpubr)
+library(caret)
+library(dataPreparation)
+library("ggfortify")
+library("corrplot")
+library("Hmisc")
+library("survival")
+library("survminer")
+library("forestmodel")
+library(coxed)
+```
+
+Function for generating tables.
+```{r}
+#FUNCTION for full results table (all covs)
+# PARAMS:
+#   coxfit: CoxPH summary
+#   listCoef: List of coefficient variables
+res_tab <- function(coxfit, listCoef){
+  df <- as_tibble(summary(coxfit)[coef_val]$coef) %>% 
+  left_join(as_tibble(summary(coxfit)[ci_val]$conf.int),  by = 'exp(coef)') %>% 
+  cbind(Covariate = listCoef) %>% 
+  select(Covariate, Beta = 'coef', HR = 'exp(coef)', 
+         p.val = 'Pr(>|z|)', LB = 'lower .95', UB = 'upper .95') %>% 
+  mutate(logLB = log(LB), logUB = log(UB))
+}
+```
+
+
+#Simulated Survival data
+```{r}
+#Make random dataset
+X_creation = cbind(rbinom(850, 1, 0.5), rbinom(850, 1, 0.5), rbinom(850, 1, 0.5))
+
+#N = patients, T = range of survival times
+simdata <- sim.survdata(X = X_creation, T = 10000, censor=.2 ,beta=c(1, -2,2), num.data.frames=1)
+beta_known <- simdata$betas
+
+#GENERATE dataset of binaries
+simdf <- simdata$data %>% 
+  mutate(
+  #        X1 = ifelse(X1 >= median(X1), 1, 0), 
+  #        X2 = ifelse(X2 >= median(X2), 1, 0), 
+  #        X3 = ifelse(X3 >= median(X3), 1, 0),
+         failed = ifelse(failed == 'TRUE', 1, 0)) %>% 
+  select(coef1 = X1, coef2 = X2, coef3 = X3, time = y, status = failed) 
+write_csv(simdf, paste0(dir, "data_sim/", "3coef_SIMDATA.csv"))
+
+coxmodel <- coxph(Surv(time, status) ~ ., data=simdf)
+summary(coxmodel)
+
+results_table_sim <- res_tab(coxmodel, c("coef1", "coef2", "coef3")) %>% 
+select(Covariate, HR, LB, UB) %>% 
+write_csv(paste0(dir, "results_sim/", "summary_coxPH_SIMDATA.csv"))
+
+simdf_forXGB <- simdf %>% 
+  mutate(SURV_DAY_XGB = ifelse(status == 1, time, -1*time)) %>% 
+  select(coef1, coef2, coef3, SURV_DAY_XGB)%>% 
+write_csv(paste0(dir, "data_sim/", "xgb_SIMDATA.csv"))
+
+
+#5-Fold CV
+#From: https://stats.stackexchange.com/questions/61090/how-to-split-a-data-set-to-do-10-fold-cross-validation 
+#Randomly shuffle the data
+dataCV <-simdf
+dataCV <-dataCV[sample(nrow(dataCV)),]
+
+#Create 5 equally size folds
+folds <- cut(seq(1,nrow(dataCV)),breaks=5,labels=FALSE)
+listCs <- list()
+#Perform 5 fold cross validation
+for(i in 1:5){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- dataCV[testIndexes, ]
+    trainData <- dataCV[-testIndexes, ]
+    trained_cox <- (coxph(Surv(time, status) ~ ., data = trainData))
+    listCs <-
+      c(listCs, survConcordance(
+        Surv(time, status) ~ predict(trained_cox, testData),
+        testData
+      )$concordance)
+    
+}
+listCs
+#Print values
+for (i in 1:5){
+  print((listCs[i]$concordant[1]))
+}
+
+#get 5-Fold CV results for plots
+cox5fcv <-c(0.7946081, 0.7872674, 0.7634267, 0.8172029, 0.7870754)
+meanSIM <- mean(cox5fcv)
+sdSIM = sd(cox5fcv)
+meanSIM
+sdSIM
+```
+
