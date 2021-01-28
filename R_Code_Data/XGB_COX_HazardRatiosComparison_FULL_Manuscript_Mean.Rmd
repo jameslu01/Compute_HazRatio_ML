@@ -1,0 +1,708 @@
+Computing the Hazard Ratios associated with Explanatory Variables using Machine Learning Models of Survival Data
+Authors: Sameer Sundrani and James Lu,*
+
+Affiliations: 
+1) Modeling & Simulation/Clinical Pharmacology, Genentech, South San Francisco, California 
+2) Biomedical Computation, Schools of Engineering and Medicine, Stanford University, Stanford, California 
+*Corresponding author. Email: lu.james@gene.com 
+
+
+This R Notebook contains all the code used for CoxPH / XGBoost Comparisons. 
+
+The code is divided into the following sections:
+(1) Set Directory
+(2) Packages and Functions 
+(3) Breast Cancer Data Analysis 
+(4) Colon Cancer Data Analysis 
+(5) Pan-Cancer Data Analysis
+
+Set working directory for saving files
+```{r}
+#Location of where to store resulting files and figures, everything will be saved here
+dir <- paste0(dirname(rstudioapi::getActiveDocumentContext()$path),"/")
+dir.create("data_process")
+dir.create("data_normalized")
+dir.create("figures")
+dir.create("results")
+
+#global constants used for parsing dataframes
+coef_val <- 7 #location in the CoxPH table for coef
+ci_val <- 8 #location in the CoxPH table for CI
+```
+
+Include These Packages for Analysis
+```{r}
+#package needed for Breast Cancer data
+library("condSURV")
+
+#packages specific for Nature Data b/c we need to clean the data
+library(rpart)
+library(mice)
+library(dummies)
+
+#general packages
+library(tidyverse)
+library(extraFunctions)
+library(haven)
+library(rlang)
+library(aod)
+library(ggpubr)
+library(caret)
+library(dataPreparation)
+library("ggfortify")
+library("corrplot")
+library("Hmisc")
+library("survival")
+library("survminer")
+library("forestmodel")
+library(coxed)
+```
+
+Functions for generating tables, KM curves, etc.
+```{r}
+#FUNCTION for full results table (all covs)
+# PARAMS:
+#   coxfit: CoxPH summary
+#   listCoef: List of coefficient variables
+res_tab <- function(coxfit, listCoef){
+  df <- as_tibble(summary(coxfit)[coef_val]$coef) %>% 
+  left_join(as_tibble(summary(coxfit)[ci_val]$conf.int),  by = 'exp(coef)') %>% 
+  cbind(Covariate = listCoef) %>% 
+  select(Covariate, Beta = 'coef', HR = 'exp(coef)', 
+         p.val = 'Pr(>|z|)', LB = 'lower .95', UB = 'upper .95') %>% 
+  mutate(logLB = log(LB), logUB = log(UB))
+}
+
+#FUNCTION for summary table and to generate a summary table 
+#of appropriate medians for NON-BINARY COVS.
+# PARAMS:
+#   inputNormalizedDf: normalized data
+#   nonbinDf: summary table of the nonbinary covariates
+#   listCoef:List of coefficent variables
+nonbin_summary <- function(inputNormalizedDf, nonbinDf, listCoef){
+  totalList <- list()
+  i <- 1
+  for (var in listCoef){
+    gMean <-
+      mean(as.numeric(unlist(inputNormalizedDf[inputNormalizedDf[[var]] >= median(inputNormalizedDf[[var]], na.rm = T), var])), na.rm = T)
+    lMean <-
+      mean(as.numeric(unlist(inputNormalizedDf[inputNormalizedDf[[var]] < median(inputNormalizedDf[[var]], na.rm = T), var])), na.rm = T)
+    totalList <-
+      c(totalList, 
+        exp(nonbinDf[i, 2] * (gMean - lMean)), 
+        exp(nonbinDf[i,3] * (gMean - lMean)), 
+        exp(nonbinDf[i,4] * (gMean - lMean)))
+    
+    i <- i + 1
+  }
+  #create df
+  totalList <- unlist(totalList)
+  finaldf <- data.frame(0)
+  loc <- 1
+  for (i in 1:length(listCoef)){
+    for (j in 1:3){
+      if (j == 1){
+        curCol <- paste0("HR_", listCoef[i])
+      }
+      if (j == 2){
+        curCol <- paste0("HR_", listCoef[i], ".LB")
+      } 
+      if (j == 3){
+         curCol <- paste0("HR_", listCoef[i], ".UB")
+      }
+      finaldf[[curCol]] <- totalList[loc] 
+      loc <- loc + 1
+    }
+  }
+  return(select(finaldf, -X0))
+}
+
+#FUNCTION for KM plots for given Tumor types.
+# PARAMS:
+#   km_fit:  survival model fit of data
+#   tumorTypeName: name of the tumor type to stratify by
+#   coxData:dataset input for the KM graph
+KMPlots <- function(km_fit, tumorTypeName, coxData){
+  tumor_plot <- ggsurvplot(
+    km_fit,
+    data = coxData,
+    surv.median.line = "hv",
+    # Add medians survival
+    # Change legends: title & labels
+    # legend.title = paste0("T_Type", tumorTypeName, " KM Curves"),
+    legend.labs = c(paste0(tumorTypeName, " Negative"), paste0(tumorTypeName, " Positive")),
+    ylim = c(0, 1),
+    # Add p-value and intervals
+    pval = FALSE,
+    conf.int = TRUE,
+    # Add risk table
+    risk.table = TRUE,
+    tables.height = 0.2,
+    break.time.by = 1000, #to get more granular information
+    tables.theme = theme_cleantable(),
+    # Color palettes. Use custom color: c("#E7B800", "#2E9FDF"),
+    # or brewer color (e.g.: "Dark2"), or ggsci color (e.g.: "jco")
+    palette = c("#E7B800", "#2E9FDF"),
+    ggtheme = theme_bw() # Change ggplot2 theme
+  )
+  print(tumor_plot) #output so that we can see out results
+  ggsave(plot = print(tumor_plot), paste0(dir, "figures/", "KMPlotTumor", tumorTypeName, ".png"))
+}
+```
+
+
+Breast Cancer Dataset (see: https://warwick.ac.uk/fac/sci/statistics/apts/students/resources-1617/gbcs.txt)
+```{r}
+head(gbcsCS)
+
+# Prepare Data for XGB
+BreastCancerDataSet <-as.data.frame(gbcsCS) %>%
+  # need to convert to XGB understandable survival times (see XGB documentation for details)
+  mutate(SURV_DAY_XGB = ifelse(censdead == 1, survtime, -1*survtime))
+# uncomment below to write the resulting file to .csv
+write_csv(BreastCancerDataSet, paste0(dir, "data_process/", "XGB_BCDS.csv"))
+
+BreastCancerDataSet_normalized <-BreastCancerDataSet %>% 
+  select(id, age, menopause, hormone, size, grade, nodes, prog_recp, estrg_recp, survtime, censdead, SURV_DAY_XGB) %>%
+  # normalize the data by min and max values 
+  mutate(age = ( (age - min(age)) / (max(age) - min(age))),
+         menopause = menopause - 1, 
+         hormone = hormone - 1, 
+         size = ( (size - min(size)) / (max(size) - min(size))),
+         prog_recp = ( (prog_recp - min(prog_recp)) / (max(prog_recp) - min(prog_recp))), 
+         estrg_recp = ( (estrg_recp - min(estrg_recp)) / (max(estrg_recp) - min(estrg_recp)))
+    )
+write_csv(BreastCancerDataSet_normalized, paste0(dir, "data_normalized/", "XGB_BCDS_normalized.csv"))
+
+# normalized CoxPH results
+breastCancerCoxPH_normalized <- coxph(Surv(survtime, censdead) ~ ., data = select(BreastCancerDataSet_normalized, -id, -SURV_DAY_XGB))
+# save the data
+sink(paste0(dir, "results/", "summary_coxPH_normalized_bcd.csv"))
+summary(breastCancerCoxPH_normalized)
+concordance(breastCancerCoxPH_normalized)
+sink()
+
+#Generate materials for the XGB Model comparison
+listCoeffients = c("age","menopause","hormone", "size", "grade", "nodes", "prog_recp","estrg_recp")
+
+#full results table (all covs)
+results_table_bc <- res_tab(breastCancerCoxPH_normalized, listCoeffients)
+write_csv(results_table_bc, paste0(dir, "results/", "summary_coxPH_ALLVars_bcd.csv"))
+
+#Binary covs only
+results_binary_bc <- results_table_bc %>% 
+  filter(Covariate %in% c('menopause', 'hormone'))
+write_csv(results_binary_bc, paste0(dir,"results/", "summary_coxPH_BINARYVARS_bcd.csv"))
+
+#Non-binary covs only
+results_nonbin_bc <- results_table_bc %>% 
+  filter(Covariate %in% c("age", "size", "grade", "nodes", "prog_recp","estrg_recp")) %>% 
+  select(Covariate, Beta, logLB, logUB)
+write_csv(results_nonbin_bc, paste0(dir,"results/", "summary_coxPH_NONBINVARS_bcd.csv"))
+
+
+BCD_nonbin_summary <- nonbin_summary(BreastCancerDataSet_normalized, results_nonbin_bc, list("age", "size", "grade", "nodes", "prog_recp","estrg_recp"))
+write_csv(BCD_nonbin_summary, paste0(dir, "results/", "summary_coxPH_nonbinVARS.csv"))
+
+
+# From: https://stats.stackexchange.com/questions/61090/how-to-split-a-data-set-to-do-10-fold-cross-validation
+# Randomly shuffle the data
+dataCV <-BreastCancerDataSet_normalized
+dataCV <-dataCV[sample(nrow(dataCV)),]
+
+# Create 5 equally size folds
+folds <- cut(seq(1,nrow(dataCV)),breaks=5,labels=FALSE)
+listCs <- list()
+# Perform 5 fold cross validation
+for(i in 1:5){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- dataCV[testIndexes, ]
+    trainData <- dataCV[-testIndexes, ]
+    trained_cox <- (coxph(Surv(survtime, censdead) ~ age + menopause + hormone + size + grade + nodes +  prog_recp + estrg_recp, data = trainData))
+    listCs <-
+      c(listCs, survConcordance(
+        Surv(survtime, censdead) ~ predict(trained_cox, testData),
+        testData
+      )$concordance)
+}
+# Print results
+for (i in 1:5){
+  print((listCs[i]$concordant[1]))
+}
+#END 5-Fold CV
+
+# For correlation exploration between covariates
+BreastCancerDataSetcors <- BreastCancerDataSet %>% 
+  select(age, menopause, hormone, size, grade, nodes, prog_recp, estrg_recp)
+matrix_cor <- rcorr(as.matrix(BreastCancerDataSetcors), type = "pearson")
+# print(matrix_cor)
+corrplot(matrix_cor$r, type="upper", order="hclust",method="color", 
+         p.mat = matrix_cor$P, sig.level = 0.05, insig = "blank", tl.col="black", tl.srt=45)
+  dev.copy(png, paste0(dir, "figures/", "pearsoncorrelogram_bcd.png"))
+  dev.off()
+
+  
+### To generate same means and sds from figures ###  
+
+# Taken from run of the CoxPH 5-Fold CV
+coxCMean <-  mean(c(0.7331452, 0.715131, 0.7260905, 0.7266426, 0.782861))
+coxCMean_sd <-  sd(c(0.7331452, 0.715131, 0.7260905, 0.7266426, 0.782861))
+
+# Taken from XGBoost 5-fold CV
+xgbCMean <- mean(c(0.7839305103148752,
+ 0.6783340717766947,
+ 0.7650669642857143,
+ 0.7093124456048738,
+ 0.8002033553634977))
+xgbCMean_sd <- sd(c(0.7839305103148752,
+ 0.6783340717766947,
+ 0.7650669642857143,
+ 0.7093124456048738,
+ 0.8002033553634977))
+```
+
+
+
+
+Colon Cancer Dataset (see: https://stat.ethz.ch/R-manual/R-patched/library/survival/html/colon.html)
+```{r}
+head(colon)
+ColonCancerDataSet <-as.data.frame(colon) %>% 
+  group_by(id) %>% 
+  filter(time == max(time) & etype == 2) %>% 
+  mutate(rx = case_when(rx == "Obs" ~ 0, 
+                        rx == "Lev" ~ 1, 
+                        rx == "Lev+5FU" ~ 2), 
+         rx = as.numeric(as.vector(rx)),
+    # generate XGB understandable survival times
+    SURV_DAY_XGB = ifelse(status == 1, time, -1*time)) %>%
+  select(-study, -etype, -node4)
+
+
+# Normalized Colon Cancer Data
+ColonCancerDataSet_normalized <-ColonCancerDataSet %>%
+  ungroup() %>% 
+  mutate(age = ((age - min(age)) / (max(age) - min(age))),
+         nodes = ((nodes - min(nodes, na.rm = T)) / (max(nodes, na.rm = T) - min(nodes, na.rm = T))))
+head(ColonCancerDataSet_normalized)
+write_csv(ColonCancerDataSet_normalized, paste0(dir, "data_normalized/", "XGB_COLON_normalized.csv"))
+
+# Normalized Colon Cancer CoxPH results
+colonCancerCoxPH <- coxph(Surv(time, status) ~ rx + age + sex + obstruct + perfor + adhere + nodes + differ + extent + surg, data = ColonCancerDataSet_normalized)
+#save the data
+sink(paste0(dir, "results/", "summary_coxPH_normalized_ccd.csv"))
+summary(colonCancerCoxPH)
+concordance(colonCancerCoxPH)
+sink()
+
+# Generate materials for the XGB Model comparison
+listCoeffients = c("rx","age", "sex","obstruct",  "perfor",  "adhere",  "nodes" ,"differ",  "extent",  "surg")
+
+# All covs results
+results_table_colon <- res_tab(colonCancerCoxPH, listCoeffients)
+
+# Binary only
+results_binary_colon <- results_table_colon %>% 
+  filter(Covariate %in% c('sex', 'obstruct', 'perfor', 'adhere', 'surg'))
+write_csv(results_binary_colon, paste0(dir, "results/", "summary_coxPH_BINARYVARS_ccd.csv"))
+
+# Non-binary only
+results_nonbin_colon <- results_table_colon %>% 
+  filter(Covariate %in% c("rx","age","nodes" ,"differ",  "extent")) %>% 
+  select(Covariate, Beta, logLB, logUB)
+write_csv(results_nonbin_colon, paste0(dir, "results/","summary_coxPH_NONBINARYVARS_ccd.csv"))
+
+COLON_nonbin_summary <- nonbin_summary(ColonCancerDataSet_normalized, results_nonbin_colon, list("rx", "age", "nodes" ,"differ", "extent"))
+write_csv(COLON_nonbin_summary, paste0(dir,"results/", "summary_coxPH_NONBINVARS_ccd.csv"))
+
+##########
+#COLON age cont. test James Nov. 2nd
+ColonCancerDataSet_normalized_ageBinary <- ColonCancerDataSet_normalized %>% 
+  mutate(age_bin = ifelse(age >= median(age, na.rm=T), 1, 0))
+# Normalized Colon Cancer AGE BINARY CoxPH results
+colonCancerCoxPH_ageBinary <- coxph(Surv(time, status) ~ rx + age_bin + sex + obstruct + perfor + adhere + nodes + differ + extent + surg, data = ColonCancerDataSet_normalized_ageBinary)
+summary(colonCancerCoxPH_ageBinary)
+##########
+
+#5-Fold CV 
+#From: https://stats.stackexchange.com/questions/61090/how-to-split-a-data-set-to-do-10-fold-cross-validation 
+#Randomly shuffle the data
+dataCV <-ColonCancerDataSet_normalized
+dataCV <-dataCV[sample(nrow(dataCV)),]
+
+#Create 5 equally size folds
+folds <- cut(seq(1,nrow(dataCV)),breaks=5,labels=FALSE)
+listCs <- list()
+#Perform 5 fold cross validation
+for(i in 1:5){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- dataCV[testIndexes, ]
+    trainData <- dataCV[-testIndexes, ]
+    trained_cox <- (coxph(Surv(time, status) ~ rx + age + sex + obstruct + perfor + adhere + nodes + differ + extent + surg, data = trainData))
+    listCs <-
+      c(listCs, survConcordance(
+        Surv(time, status) ~ predict(trained_cox, testData),
+        testData
+      )$concordance)
+    
+}
+# Print results
+for (i in 1:5){
+  print((listCs[i]$concordant[1]))
+}
+#END 5-Fold CV
+
+#Test for correlations
+ColonCancerDataSet_cors <- ColonCancerDataSet %>%
+  select(-id, -time, -SURV_DAY_XGB)
+  
+matrix_cor_2 <- rcorr(as.matrix(ColonCancerDataSet_cors), type = "pearson")
+# print(matrix_cor)
+corrplot(matrix_cor_2$r, type="upper", order="hclust",method="color", 
+         p.mat = matrix_cor_2 $P, sig.level = 0.05, insig = "blank", tl.col="black", tl.srt=45)
+  dev.copy(png, paste0(dir, "figures/", "pearsoncorrelogram_oct11.png"))
+  dev.off()
+  
+  
+### To generate same means and sds from figures ### 
+
+# Taken from run of the CoxPH 5-Fold CV
+cVal <- mean(c(0.6098947, 0.6751284, 0.6756624, 0.6192138, 0.6549967))
+cVal_std <- sd(c(0.6098947, 0.6751284, 0.6756624, 0.6192138, 0.6549967))
+
+# Taken from run of the XGBoost 5-Fold CV
+cValXGB <- mean(c(0.6955977988994497,
+ 0.6293322628127928,
+ 0.6540423361387401,
+ 0.6898670679709055,
+ 0.6479621290844013))
+cValXGB_std <- sd(c(0.6955977988994497,
+ 0.6293322628127928,
+ 0.6540423361387401,
+ 0.6898670679709055,
+ 0.6479621290844013))
+```
+
+
+Nature Dataset (only Covs used from the Wang thesis, see: https://www.nature.com/articles/nature12634 in supp data 8)
+```{r}
+#Load data from dataset directory (specified at top)
+#Vital.status = 1 if the event of interest is observed, Vital.status = 0 if the observation is censored.
+NatureData <- as_tibble(read.csv(paste0(dir, "NatureDataSuppTable.csv"), stringsAsFactors=F), col_types = col_double()) 
+
+NatureData_imputed <- NatureData %>% 
+  #convert to binary, impute medians, and exclude patients with no conclusive Survival Data
+  mutate(
+    Gender.female = ifelse(Gender == "female", 1, 0), 
+    Years.to.birth = impute(Years.to.birth, median), 
+    Tumor.stage = impute(Tumor.stage, median), 
+    # now let's make sure that we have survival times
+    time_event = 
+      case_when(
+        !is.na(Days.to.death) ~ as.numeric(Days.to.death),
+        is.na(Days.to.death) &
+          !is.na(Days.to.last.followup) ~ as.numeric(Days.to.last.followup),
+        T ~ -1
+  )) %>%
+  filter(time_event > 0) %>% 
+  select(-Gender, -Tumor.grade, -Days.to.death, -Days.to.last.followup)
+  
+
+# Dataset to add dummy covs for tumor types
+NatureData_imputed_dummy <- fastDummies::dummy_cols(NatureData_imputed, 
+                                                        select_columns = "TCGA.tumor.type", 
+                                                    remove_first_dummy = TRUE)
+
+
+#From Wang Thesis, "We chose to discard observations with outliers in Somatic.mutations and Nonsilent.somatic.mutations to reduce the noise in the model." Following this, we are aiming to get a dataset that is normalized and close to the results from the Wang thesis.
+full_data_nature_normalized <- select(NatureData_imputed_dummy, Sample.ID, Gender.female, Years.to.birth, Vital.status, time_event, Date.of.initial.pathologic.diagnosis, Somatic.mutations, Nonsilent.somatic.mutations, Tumor.stage, TCGA.tumor.type_brca, TCGA.tumor.type_coadread, TCGA.tumor.type_gbm, TCGA.tumor.type_hnsc, TCGA.tumor.type_kirc, TCGA.tumor.type_laml, TCGA.tumor.type_luad, TCGA.tumor.type_lusc, TCGA.tumor.type_ov, TCGA.tumor.type_ucec) %>% 
+  # Now, we normalize
+  mutate(SURV_DAY_XGB = ifelse(Vital.status == 1, time_event, -1*time_event), 
+           Years.to.birth = (Years.to.birth - min(Years.to.birth)) / (max(Years.to.birth) - min(Years.to.birth)), 
+         Date.of.initial.pathologic.diagnosis = (Date.of.initial.pathologic.diagnosis - min(Date.of.initial.pathologic.diagnosis)) / (max(Date.of.initial.pathologic.diagnosis) - min(Date.of.initial.pathologic.diagnosis)), 
+         Somatic.mutations = (Somatic.mutations - min(Somatic.mutations, na.rm = T)) / (max(Somatic.mutations, na.rm = T) - min(Somatic.mutations, na.rm = T)), 
+         Nonsilent.somatic.mutations = (Nonsilent.somatic.mutations - min(Nonsilent.somatic.mutations, na.rm = T)) / (max(Nonsilent.somatic.mutations, na.rm = T) - min(Nonsilent.somatic.mutations, na.rm = T)), 
+          Tumor.stage = (Tumor.stage - min(Tumor.stage, na.rm = T)) / (max(Tumor.stage, na.rm = T) - min(Tumor.stage, na.rm = T)))
+write_csv(full_data_nature_normalized, paste0(dir, "data_normalized/", "XGB_NATURE_normalized.csv"))
+  
+
+# Run the Cox Analysis with the normalized data
+NatureCoxPH <- coxph(Surv(time_event, Vital.status) ~ Gender.female + Years.to.birth + Date.of.initial.pathologic.diagnosis + Somatic.mutations + Nonsilent.somatic.mutations + Tumor.stage + TCGA.tumor.type_brca + TCGA.tumor.type_coadread + TCGA.tumor.type_gbm + TCGA.tumor.type_hnsc + TCGA.tumor.type_kirc + TCGA.tumor.type_laml + TCGA.tumor.type_luad + TCGA.tumor.type_lusc + TCGA.tumor.type_ov + TCGA.tumor.type_ucec, data = full_data_nature_normalized)
+# Save the data
+sink(paste0(dir, "results/", "summary_coxPH_normalized_nature.csv"))
+summary(NatureCoxPH)
+concordance(NatureCoxPH)
+sink()
+
+# Generate materials for the XGB Model comparison
+listCoeffients = c("Gender.female", "Years.to.birth", "Date.of.initial.pathologic.diagnosis", "Somatic.mutations", "Nonsilent.somatic.mutations", "Tumor.stage", "TCGA.tumor.type_brca", "TCGA.tumor.type_coadread", "TCGA.tumor.type_gbm", "TCGA.tumor.type_hnsc", "TCGA.tumor.type_kirc", "TCGA.tumor.type_laml", "TCGA.tumor.type_luad", "TCGA.tumor.type_lusc", "TCGA.tumor.type_ov", "TCGA.tumor.type_ucec")
+
+# All Covariates
+results_table <- res_tab(NatureCoxPH, listCoeffients)
+
+# Binary covs only
+results_binary <- results_table %>% 
+  filter(Covariate %in% c("Gender.female", "TCGA.tumor.type_brca", "TCGA.tumor.type_coadread", "TCGA.tumor.type_gbm", "TCGA.tumor.type_hnsc", "TCGA.tumor.type_kirc", "TCGA.tumor.type_laml", "TCGA.tumor.type_luad", "TCGA.tumor.type_lusc", "TCGA.tumor.type_ov", "TCGA.tumor.type_ucec"))
+write_csv(results_binary, paste0(dir, "results/", "summary_coxPH_BINARYVARS_natWangOnly.csv"))
+
+# Non-binary covs only 
+results_nonbin <- results_table %>% 
+  filter(Covariate %in% c("Years.to.birth", "Date.of.initial.pathologic.diagnosis", "Somatic.mutations", "Nonsilent.somatic.mutations", "Tumor.stage")) %>% 
+  select(Covariate, Beta, logLB, logUB)
+
+XGB_SUMMARY_TESTFUNCTION <-  nonbin_summary(full_data_nature_normalized,  results_nonbin, list("Years.to.birth", "Date.of.initial.pathologic.diagnosis", "Somatic.mutations", "Nonsilent.somatic.mutations", "Tumor.stage"))
+class(XGB_SUMMARY_TESTFUNCTION)
+write_csv(XGB_SUMMARY_TESTFUNCTION, paste0(dir, "results/", "summary_coxPH_NONBINVARS_nature_wangonly.csv"))
+
+
+#5-Fold CV 
+#From: https://stats.stackexchange.com/questions/61090/how-to-split-a-data-set-to-do-10-fold-cross-validation 
+#Randomly shuffle the data
+dataCV <-full_data_nature_normalized
+dataCV <-dataCV[sample(nrow(dataCV)),]
+
+#Create 5 equally size folds
+folds <- cut(seq(1,nrow(dataCV)),breaks=5,labels=FALSE)
+listCs <- list()
+#Perform 5 fold cross validation
+for(i in 1:5){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- dataCV[testIndexes, ]
+    trainData <- dataCV[-testIndexes, ]
+    trained_cox <- (coxph(Surv(time_event, Vital.status) ~ Gender.female + Years.to.birth + Date.of.initial.pathologic.diagnosis + Somatic.mutations + Nonsilent.somatic.mutations + Tumor.stage + TCGA.tumor.type_brca + TCGA.tumor.type_coadread + TCGA.tumor.type_gbm + TCGA.tumor.type_hnsc + TCGA.tumor.type_kirc + TCGA.tumor.type_laml + TCGA.tumor.type_luad + TCGA.tumor.type_lusc + TCGA.tumor.type_ov + TCGA.tumor.type_ucec, data = trainData))
+    listCs <-
+      c(listCs, survConcordance(
+        Surv(time_event, Vital.status) ~ predict(trained_cox, testData),
+        testData
+      )$concordance)
+    
+}
+listCs
+#Print the results
+for (i in 1:5){
+  print((listCs[i]$concordant[1]))
+}
+#END 5-Fold CV
+
+#Generate KM Curves by tumor types
+tumorVar <-  full_data_nature_normalized$TCGA.tumor.type_luad
+tumorVar2 <- full_data_nature_normalized$TCGA.tumor.type_lusc
+tumorTypeName <- 'LUAD'
+tumorTypeName2 <- 'LUSC'
+km_fit <- survfit(Surv(time_event, Vital.status) ~ tumorVar, data = full_data_nature_normalized)
+km_fit2 <- survfit(Surv(time_event, Vital.status) ~ tumorVar2, data = full_data_nature_normalized)
+KMPlots(km_fit, tumorTypeName, full_data_nature_normalized)
+KMPlots(km_fit2, tumorTypeName2, full_data_nature_normalized)
+```
+
+Nature Data with ALL Covariates 
+```{r}
+nature_all <- full_data_nature_normalized %>% 
+  left_join(select(NatureData_imputed, -Vital.status, -time_event, -TCGA.tumor.type, -Gender.female, -Years.to.birth, -Date.of.initial.pathologic.diagnosis, -Somatic.mutations, -Nonsilent.somatic.mutations, -Tumor.stage), by = "Sample.ID")
+write_csv(nature_all, paste0(dir, "data_normalized/", "XGB_NATURE_ALL_normalized.csv"))
+
+coxData <- (select(nature_all, - Sample.ID, -SURV_DAY_XGB))
+NatureCoxPH_all <- coxph(Surv(time_event, Vital.status) ~ ., data = coxData)
+summary(NatureCoxPH_all)
+# Get concordance value from Cox model using "predict"
+survConcordance(Surv(time_event, Vital.status) ~ predict(NatureCoxPH_all, coxData), coxData)
+#save the data
+sink(paste0(dir, "results/", "summary_coxPH_ALL_normalized_natureall.csv"))
+summary(NatureCoxPH_all)
+concordance(NatureCoxPH_all)
+sink()
+
+# Generate materials for the XGB Model comparison 
+myColNames <- colnames(select(nature_all, -Sample.ID, -SURV_DAY_XGB, -time_event, -Vital.status))
+
+# All covs
+results_table_all <- res_tab(NatureCoxPH_all, myColNames)
+write_csv(results_table_all, paste0(dir, "results/","summary_coxPH_ALL_natureall.csv"))
+# Non-binary covs
+results_nonbin_all <- results_table_all %>% 
+  filter(Covariate %in% c("Years.to.birth", "Date.of.initial.pathologic.diagnosis", "Somatic.mutations", "Nonsilent.somatic.mutations", "Tumor.stage")) %>% 
+  select(Covariate, Beta, logLB, logUB)
+write_csv(results_nonbin_all, paste0(dir, "results/","summary_coxPH_NONBINVARS_ALL_natureall.csv"))
+
+# Binary covs
+results_binary_all <- results_table_all %>% 
+  anti_join(results_nonbin_all, by = "Covariate") %>% 
+  select(Covariate, HR, LB, UB)
+write_csv(results_binary_all, paste0(dir,"results/", "summary_coxPH_BINARYVARS_ALL_natureall.csv"))
+
+XGB_SUMMARY_ALL <- nonbin_summary(nature_all, results_nonbin_all, list("Years.to.birth", "Date.of.initial.pathologic.diagnosis", "Somatic.mutations", "Nonsilent.somatic.mutations", "Tumor.stage"))
+write_csv(XGB_SUMMARY_ALL, paste0(dir,"results/", "summary_coxPH_NONBINVARS_ALL_natureall.csv"))
+
+#5-Fold CV
+#From: https://stats.stackexchange.com/questions/61090/how-to-split-a-data-set-to-do-10-fold-cross-validation 
+#Randomly shuffle the data
+dataCV <-coxData
+dataCV <-dataCV[sample(nrow(dataCV)),]
+
+#Create 5 equally size folds
+folds <- cut(seq(1,nrow(dataCV)),breaks=5,labels=FALSE)
+listCs <- list()
+#Perform 5 fold cross validation
+for(i in 1:5){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- dataCV[testIndexes, ]
+    trainData <- dataCV[-testIndexes, ]
+    trained_cox <- (coxph(Surv(time_event, Vital.status) ~ ., data = trainData))
+    listCs <-
+      c(listCs, survConcordance(
+        Surv(time_event, Vital.status) ~ predict(trained_cox, testData),
+        testData
+      )$concordance)
+    
+}
+listCs
+#Print values
+for (i in 1:5){
+  print((listCs[i]$concordant[1]))
+}
+
+
+tumorVar3 <- coxData$TCGA.tumor.type_gbm
+km_fit3 <- survfit(Surv(time_event, Vital.status) ~ tumorVar3, data = coxData)
+KMPlots(km_fit3, 'GBM', coxData)
+
+#Generate KM Curves by tumor types
+tumorVar <-  coxData$TCGA.tumor.type_luad
+tumorVar2 <- coxData$TCGA.tumor.type_lusc
+tumorTypeName <- 'LUAD_ALL'
+tumorTypeName2 <- 'LUSC_ALL'
+km_fit <- survfit(Surv(time_event, Vital.status) ~ tumorVar, data = coxData)
+
+KMPlots(km_fit, tumorTypeName, coxData)
+KMPlots(km_fit2, tumorTypeName2, coxData)
+
+### To generate same means and sds from figures ### 
+
+#Get average from results
+mean(c(0.7466364, 0.7911606, 0.7679637, 0.7341046, 0.7471551))
+
+```
+
+
+Nature, all data, no imputations for XGB to see comparative performance
+```{r}
+nature_all_normalized_noimputations <- NatureData %>%
+  mutate(
+    Gender.female = ifelse(Gender == "female", 1, 0),
+    # now let's make sure that we have survival times
+    time_event =
+      case_when(
+        !is.na(Days.to.death) ~ as.numeric(Days.to.death),
+        is.na(Days.to.death) &
+          !is.na(Days.to.last.followup) ~ as.numeric(Days.to.last.followup),
+        T ~ -1
+      ),
+    SURV_DAY_XGB = ifelse(Vital.status == 1, time_event, -1 * time_event),
+    Years.to.birth = (Years.to.birth - min(Years.to.birth, na.rm = T)) / (max(Years.to.birth, na.rm = T) - min(Years.to.birth, na.rm = T)),
+    Date.of.initial.pathologic.diagnosis = (
+      Date.of.initial.pathologic.diagnosis - min(Date.of.initial.pathologic.diagnosis, na.rm = T)
+    ) / (
+      max(Date.of.initial.pathologic.diagnosis, na.rm = T) - min(Date.of.initial.pathologic.diagnosis, na.rm = T)
+    ),
+    Somatic.mutations = (Somatic.mutations - min(Somatic.mutations, na.rm = T)) / (
+      max(Somatic.mutations, na.rm = T) - min(Somatic.mutations, na.rm = T)
+    ),
+    Nonsilent.somatic.mutations = (
+      Nonsilent.somatic.mutations - min(Nonsilent.somatic.mutations, na.rm = T)
+    ) / (
+      max(Nonsilent.somatic.mutations, na.rm = T) - min(Nonsilent.somatic.mutations, na.rm = T)
+    ),
+    Tumor.stage = (Tumor.stage - min(Tumor.stage, na.rm = T)) / (max(Tumor.stage, na.rm = T) - min(Tumor.stage, na.rm = T)),
+  ) %>%
+  filter(time_event > 0) %>%
+  select(-Gender,-Tumor.grade,-Days.to.death,-Days.to.last.followup) %>%
+  fastDummies::dummy_cols(select_columns = "TCGA.tumor.type", remove_first_dummy = TRUE) %>% 
+  select(-TCGA.tumor.type)
+
+write_csv(nature_all_normalized_noimputations, paste0(dir, "data_normalized/", "XGB_NATURE_ALL_noimputing_normalized.csv"))
+
+```
+
+Generate frequency tables for significant XGB and COX Covariates
+```{r}
+SigCols <- c(
+ 'TCGA.tumor.type_brca',
+ 'TCGA.tumor.type_coadread',
+ 'TCGA.tumor.type_gbm',
+ 'TCGA.tumor.type_hnsc',
+ 'TCGA.tumor.type_kirc',
+ 'TCGA.tumor.type_laml',
+ 'TCGA.tumor.type_luad',
+ 'TCGA.tumor.type_lusc',
+ 'TCGA.tumor.type_ov',
+ 'TCGA.tumor.type_ucec',
+ 'AR',
+ 'BAP1',
+ 'CDKN1A',
+ 'CDKN1B',
+ 'DNMT3A',
+ 'EGFR',
+ 'ERCC2',
+ 'EZH2',
+ 'FBXW7',
+ 'HIST1H1C',
+ 'IDH1',
+ 'PPP2R1A',
+ 'RAD21',
+ 'RPL22',
+ 'RUNX1',
+ 'TP53')
+
+freqtables <- nature_all %>% 
+  select(SigCols)
+colSums(is.na(freqtables))
+
+freq_tables_final <- apply(freqtables, 2, table)
+write_csv(as.data.frame(freq_tables_final), paste0(dir, "freqTable.csv"))
+```
+
+```{r}
+### To generate same means and sds from figures ### 
+
+#Get cIndex Vals 
+Cox_all <-mean(c(0.7466364, 0.7911606, 0.7679637, 0.7341046, 0.7471551))
+Cox_limitedcovs <- mean(c(0.7968867, 0.7813753, 0.7727417, 0.7902709, 0.7645715))
+Cox_all_std <-sd(c(0.7466364, 0.7911606, 0.7679637, 0.7341046, 0.7471551))
+Cox_limitedcovs_std <- sd(c(0.7968867, 0.7813753, 0.7727417, 0.7902709, 0.7645715))
+xgb_lim_mean <- mean(c(0.7832576249188838,
+ 0.7938660682342993,
+ 0.7590855642757527,
+ 0.7545489972721005,
+ 0.7585598214053941))
+xgb_all_mean <- mean(c(0.7820116807268008,
+ 0.7986470224737373,
+ 0.7598238945554978,
+ 0.7561977277496328,
+ 0.7571580614178542))
+xgb_nImp_mean <- mean(c(0.7800129785853342,
+ 0.7998829154063811,
+ 0.766468867073204,
+ 0.7653107107527204,
+ 0.7605326687952652))
+xgb_lim_std <- sd(c(0.7832576249188838,
+ 0.7938660682342993,
+ 0.7590855642757527,
+ 0.7545489972721005,
+ 0.7585598214053941))
+xgb_all_std <- sd(c(0.7820116807268008,
+ 0.7986470224737373,
+ 0.7598238945554978,
+ 0.7561977277496328,
+ 0.7571580614178542))
+xgb_nImp_std <- sd(c(0.7800129785853342,
+ 0.7998829154063811,
+ 0.766468867073204,
+ 0.7653107107527204,
+ 0.7605326687952652))
+```
+
+
