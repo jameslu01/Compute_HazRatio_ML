@@ -1,0 +1,62 @@
+Call:
+coxph(formula = Surv(time_event, Vital.status) ~ Gender.female + 
+    Years.to.birth + Date.of.initial.pathologic.diagnosis + Somatic.mutations + 
+    Nonsilent.somatic.mutations + Tumor.stage + TCGA.tumor.type_brca + 
+    TCGA.tumor.type_coadread + TCGA.tumor.type_gbm + TCGA.tumor.type_hnsc + 
+    TCGA.tumor.type_kirc + TCGA.tumor.type_laml + TCGA.tumor.type_luad + 
+    TCGA.tumor.type_lusc + TCGA.tumor.type_ov + TCGA.tumor.type_ucec, 
+    data = full_data_nature_normalized)
+
+  n= 2908, number of events= 984 
+   (4 observations deleted due to missingness)
+
+                                           coef  exp(coef)   se(coef)      z Pr(>|z|)    
+Gender.female                        -9.244e-03  9.908e-01  7.906e-02 -0.117 0.906919    
+Years.to.birth                        2.132e+00  8.435e+00  2.078e-01 10.259  < 2e-16 ***
+Date.of.initial.pathologic.diagnosis -6.473e-01  5.235e-01  2.022e-01 -3.201 0.001372 ** 
+Somatic.mutations                    -1.527e+01  2.341e-07  8.673e+00 -1.760 0.078357 .  
+Nonsilent.somatic.mutations           1.384e+01  1.027e+06  8.881e+00  1.559 0.119100    
+Tumor.stage                           1.324e+00  3.759e+00  1.277e-01 10.368  < 2e-16 ***
+TCGA.tumor.type_brca                 -1.964e+00  1.404e-01  2.494e-01 -7.872 3.50e-15 ***
+TCGA.tumor.type_coadread             -1.366e+00  2.552e-01  3.533e-01 -3.866 0.000111 ***
+TCGA.tumor.type_gbm                   8.940e-01  2.445e+00  2.238e-01  3.994 6.49e-05 ***
+TCGA.tumor.type_hnsc                 -9.766e-01  3.766e-01  2.205e-01 -4.429 9.45e-06 ***
+TCGA.tumor.type_kirc                 -1.259e+00  2.840e-01  2.287e-01 -5.505 3.69e-08 ***
+TCGA.tumor.type_laml                  4.318e-01  1.540e+00  2.432e-01  1.776 0.075793 .  
+TCGA.tumor.type_luad                 -2.522e-01  7.771e-01  2.483e-01 -1.016 0.309594    
+TCGA.tumor.type_lusc                 -2.696e-01  7.637e-01  2.308e-01 -1.168 0.242843    
+TCGA.tumor.type_ov                   -1.080e+00  3.397e-01  2.359e-01 -4.577 4.71e-06 ***
+TCGA.tumor.type_ucec                 -2.186e+00  1.123e-01  3.211e-01 -6.810 9.74e-12 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+                                     exp(coef) exp(-coef) lower .95 upper .95
+Gender.female                        9.908e-01  1.009e+00 8.486e-01 1.157e+00
+Years.to.birth                       8.435e+00  1.186e-01 5.612e+00 1.268e+01
+Date.of.initial.pathologic.diagnosis 5.235e-01  1.910e+00 3.521e-01 7.781e-01
+Somatic.mutations                    2.341e-07  4.271e+06 9.702e-15 5.650e+00
+Nonsilent.somatic.mutations          1.027e+06  9.739e-07 2.830e-02 3.726e+13
+Tumor.stage                          3.759e+00  2.660e-01 2.926e+00 4.828e+00
+TCGA.tumor.type_brca                 1.404e-01  7.125e+00 8.608e-02 2.289e-01
+TCGA.tumor.type_coadread             2.552e-01  3.919e+00 1.277e-01 5.100e-01
+TCGA.tumor.type_gbm                  2.445e+00  4.090e-01 1.577e+00 3.791e+00
+TCGA.tumor.type_hnsc                 3.766e-01  2.655e+00 2.444e-01 5.802e-01
+TCGA.tumor.type_kirc                 2.840e-01  3.522e+00 1.814e-01 4.445e-01
+TCGA.tumor.type_laml                 1.540e+00  6.494e-01 9.562e-01 2.480e+00
+TCGA.tumor.type_luad                 7.771e-01  1.287e+00 4.777e-01 1.264e+00
+TCGA.tumor.type_lusc                 7.637e-01  1.309e+00 4.858e-01 1.201e+00
+TCGA.tumor.type_ov                   3.397e-01  2.944e+00 2.139e-01 5.393e-01
+TCGA.tumor.type_ucec                 1.123e-01  8.904e+00 5.986e-02 2.107e-01
+
+Concordance= 0.785  (se = 0.007 )
+Likelihood ratio test= 862.1  on 16 df,   p=<2e-16
+Wald test            = 755.2  on 16 df,   p=<2e-16
+Score (logrank) test = 975  on 16 df,   p=<2e-16
+
+Call:
+concordance.coxph(object = NatureCoxPH)
+
+n= 2908 
+Concordance= 0.7846 se= 0.0073
+concordant discordant     tied.x     tied.y    tied.xy 
+   1114067     305807          0        409          0 
