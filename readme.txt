@@ -27,6 +27,6 @@ For the simulated dataset analysis:
 
 1) Download and save the 'R_Python_Simulated_Data' folder. This should contain the relevant R and Jupyter notebooks as well as the simulated dataset used, 'xgb_SIMDATA.csv.' 
 
-2) To replicate XGBoost / CoxPH comparisons Run only the Jupyter notebook using the same preset hyperparameters. All figures will be saved to the current working directory. 
+2) To replicate XGBoost / CoxPH comparisons, run only the Jupyter notebook using the same preset hyperparameters. All figures will be saved to the current working directory. 
 
 3) To create your own simulated dataset and corresponding CoxPH output, run the R notebook in its entirety. All tables and results will be saved to respective subdirectories automatically.
